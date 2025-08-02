@@ -1,3 +1,5 @@
+import BXO from '../index';
+
 interface RateLimitOptions {
   max: number;
   window: number; // in seconds
@@ -50,7 +52,7 @@ class RateLimitStore {
   }
 }
 
-export function rateLimit(options: RateLimitOptions) {
+export function rateLimit(options: RateLimitOptions): BXO {
   const {
     max,
     window,
@@ -72,65 +74,67 @@ export function rateLimit(options: RateLimitOptions) {
   // Cleanup expired entries every 5 minutes
   setInterval(() => store.cleanup(), 5 * 60 * 1000);
 
-  return {
-    name: 'rateLimit',
-    onRequest: async (ctx: any) => {
-      const url = new URL(ctx.request.url);
-      const pathname = url.pathname;
-      
-      // Skip rate limiting for excluded paths
-      if (exclude.some(path => {
-        if (path.includes('*')) {
-          const regex = new RegExp(path.replace(/\*/g, '.*'));
-          return regex.test(pathname);
-        }
-        return pathname === path || pathname.startsWith(path);
-      })) {
-        return;
-      }
+  const rateLimitInstance = new BXO();
 
-      const key = keyGenerator(ctx);
-      const entry = store.increment(key, window);
-      
-      if (entry.count > max) {
-        const resetTime = Math.ceil(entry.resetTime / 1000);
-        throw new Response(JSON.stringify({ 
-          error: message,
-          retryAfter: resetTime - Math.floor(Date.now() / 1000)
-        }), {
-          status: statusCode,
-          headers: { 
-            'Content-Type': 'application/json',
-            'X-RateLimit-Limit': max.toString(),
-            'X-RateLimit-Remaining': '0',
-            'X-RateLimit-Reset': resetTime.toString(),
-            'Retry-After': (resetTime - Math.floor(Date.now() / 1000)).toString()
-          }
-        });
+  rateLimitInstance.onRequest(async (ctx: any) => {
+    const url = new URL(ctx.request.url);
+    const pathname = url.pathname;
+    
+    // Skip rate limiting for excluded paths
+    if (exclude.some(path => {
+      if (path.includes('*')) {
+        const regex = new RegExp(path.replace(/\*/g, '.*'));
+        return regex.test(pathname);
       }
-      
-      // Add rate limit headers
-      ctx.set.headers = {
-        ...ctx.set.headers,
-        'X-RateLimit-Limit': max.toString(),
-        'X-RateLimit-Remaining': Math.max(0, max - entry.count).toString(),
-        'X-RateLimit-Reset': Math.ceil(entry.resetTime / 1000).toString()
-      };
-    },
-    onResponse: async (ctx: any, response: any) => {
-      const status = ctx.set.status || 200;
-      const key = keyGenerator(ctx);
-      
-      // Optionally skip counting successful or failed requests
-      if ((skipSuccessful && status < 400) || (skipFailed && status >= 400)) {
-        // Decrement the counter since we don't want to count this request
-        const entry = store.get(key);
-        if (entry && entry.count > 0) {
-          store.set(key, entry.count - 1, entry.resetTime);
-        }
-      }
-      
-      return response;
+      return pathname === path || pathname.startsWith(path);
+    })) {
+      return;
     }
-  };
+
+    const key = keyGenerator(ctx);
+    const entry = store.increment(key, window);
+    
+    if (entry.count > max) {
+      const resetTime = Math.ceil(entry.resetTime / 1000);
+      throw new Response(JSON.stringify({ 
+        error: message,
+        retryAfter: resetTime - Math.floor(Date.now() / 1000)
+      }), {
+        status: statusCode,
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-RateLimit-Limit': max.toString(),
+          'X-RateLimit-Remaining': '0',
+          'X-RateLimit-Reset': resetTime.toString(),
+          'Retry-After': (resetTime - Math.floor(Date.now() / 1000)).toString()
+        }
+      });
+    }
+    
+    // Add rate limit headers
+    ctx.set.headers = {
+      ...ctx.set.headers,
+      'X-RateLimit-Limit': max.toString(),
+      'X-RateLimit-Remaining': Math.max(0, max - entry.count).toString(),
+      'X-RateLimit-Reset': Math.ceil(entry.resetTime / 1000).toString()
+    };
+  });
+
+  rateLimitInstance.onResponse(async (ctx: any, response: any) => {
+    const status = ctx.set.status || 200;
+    const key = keyGenerator(ctx);
+    
+    // Optionally skip counting successful or failed requests
+    if ((skipSuccessful && status < 400) || (skipFailed && status >= 400)) {
+      // Decrement the counter since we don't want to count this request
+      const entry = store.get(key);
+      if (entry && entry.count > 0) {
+        store.set(key, entry.count - 1, entry.resetTime);
+      }
+    }
+    
+    return response;
+  });
+
+  return rateLimitInstance;
 } 

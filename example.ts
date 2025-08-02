@@ -1,13 +1,39 @@
 import BXO, { z } from './index';
 import { cors, logger, auth, rateLimit, createJWT } from './plugins';
 
+// Create a simple API plugin that defines its own routes
+function createApiPlugin(): BXO {
+  const apiPlugin = new BXO();
+  
+  apiPlugin
+    .get('/api/info', async (ctx) => {
+      return { 
+        name: 'BXO API Plugin',
+        version: '1.0.0',
+        endpoints: ['/api/info', '/api/ping', '/api/time']
+      };
+    })
+    .get('/api/ping', async (ctx) => {
+      return { ping: 'pong', timestamp: Date.now() };
+    })
+    .get('/api/time', async (ctx) => {
+      return { time: new Date().toISOString() };
+    })
+    .post('/api/echo', async (ctx) => {
+      return { echo: ctx.body };
+    }, {
+      body: z.object({
+        message: z.string()
+      })
+    });
+    
+  return apiPlugin;
+}
+
 // Create the app instance
 const app = new BXO();
 
-// Enable hot reload
-app.enableHotReload(['./']); // Watch current directory
-
-// Add plugins
+// Add plugins (including our new API plugin)
 app
   .use(logger({ format: 'simple' }))
   .use(cors({ 
@@ -22,8 +48,9 @@ app
   .use(auth({ 
     type: 'jwt', 
     secret: 'your-secret-key',
-    exclude: ['/', '/login', '/health']
-  }));
+    exclude: ['/', '/login', '/health', '/api/*']
+  }))
+  .use(createApiPlugin()); // Add our plugin with actual routes
 
 // Add simplified lifecycle hooks
 app
@@ -38,12 +65,6 @@ app
   })
   .onAfterStop(() => {
     console.log('✅ Server fully stopped!');
-  })
-  .onBeforeRestart(() => {
-    console.log('🔧 Preparing to restart server...');
-  })
-  .onAfterRestart(() => {
-    console.log('✅ Server restart completed!');
   })
   .onRequest((ctx) => {
     console.log(`📨 Processing ${ctx.request.method} ${ctx.request.url}`);
@@ -116,13 +137,6 @@ app
     return { message: 'This is protected', user: ctx.user };
   })
 
-  // Server control endpoints
-  .post('/restart', async (ctx) => {
-    // Restart the server
-    setTimeout(() => app.restart(3000), 100);
-    return { message: 'Server restart initiated' };
-  })
-
   .get('/status', async (ctx) => {
     return {
       ...app.getServerInfo(),
@@ -162,12 +176,12 @@ console.log(`
 🦊 BXO Framework with Hot Reload
 
 ✨ Features Enabled:
-- 🔄 Hot reload (edit any .ts/.js file to restart)
 - 🎣 Full lifecycle hooks (before/after pattern)
 - 🔒 JWT authentication
 - 📊 Rate limiting  
 - 🌐 CORS support
 - 📝 Request logging
+- 🔌 API Plugin with routes
 
 🧪 Try these endpoints:
 - GET  /simple
@@ -177,7 +191,14 @@ console.log(`
 - POST /login (with JSON body: {"username": "admin", "password": "password"})
 - GET  /protected (requires Bearer token from /login)
 - GET  /status (server statistics)
-- POST /restart (restart server programmatically)
+
+🔌 API Plugin endpoints:
+- GET  /api/info (plugin information)
+- GET  /api/ping (ping pong)
+- GET  /api/time (current time)
+- POST /api/echo (echo message: {"message": "hello"})
 
 💡 Edit this file and save to see hot reload in action!
 `); 
+
+console.log(app.routes)

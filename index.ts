@@ -3,12 +3,26 @@ import { z } from 'zod';
 // Type utilities for extracting types from Zod schemas
 type InferZodType<T> = T extends z.ZodType<infer U> ? U : never;
 
+// OpenAPI detail information
+interface RouteDetail {
+  summary?: string;
+  description?: string;
+  tags?: string[];
+  operationId?: string;
+  deprecated?: boolean;
+  produces?: string[];
+  consumes?: string[];
+  [key: string]: any; // Allow additional OpenAPI properties
+}
+
 // Configuration interface for route handlers
 interface RouteConfig {
   params?: z.ZodSchema<any>;
   query?: z.ZodSchema<any>;
   body?: z.ZodSchema<any>;
   headers?: z.ZodSchema<any>;
+  response?: z.ZodSchema<any>;
+  detail?: RouteDetail;
 }
 
 // Context type that's fully typed based on the route configuration
@@ -17,28 +31,17 @@ export type Context<TConfig extends RouteConfig = {}> = {
   query: TConfig['query'] extends z.ZodSchema<any> ? InferZodType<TConfig['query']> : Record<string, string | undefined>;
   body: TConfig['body'] extends z.ZodSchema<any> ? InferZodType<TConfig['body']> : unknown;
   headers: TConfig['headers'] extends z.ZodSchema<any> ? InferZodType<TConfig['headers']> : Record<string, string>;
+  path: string;
   request: Request;
   set: {
     status?: number;
     headers?: Record<string, string>;
   };
-  // Extended properties that can be added by plugins
-  user?: any;
   [key: string]: any;
 };
 
 // Handler function type
-type Handler<TConfig extends RouteConfig = {}> = (ctx: Context<TConfig>) => Promise<any> | any;
-
-// Plugin interface (also exported from plugins/index.ts)
-interface Plugin {
-  name?: string;
-  onRequest?: (ctx: Context) => Promise<void> | void;
-  onResponse?: (ctx: Context, response: any) => Promise<any> | any;
-  onError?: (ctx: Context, error: Error) => Promise<any> | any;
-}
-
-
+type Handler<TConfig extends RouteConfig = {}, EC = {}> = (ctx: Context<TConfig> & EC) => Promise<any> | any;
 
 // Route definition
 interface Route {
@@ -48,79 +51,84 @@ interface Route {
   config?: RouteConfig;
 }
 
+// WebSocket handler interface
+interface WebSocketHandler {
+  onOpen?: (ws: any) => void;
+  onMessage?: (ws: any, message: string | Buffer) => void;
+  onClose?: (ws: any, code?: number, reason?: string) => void;
+  onError?: (ws: any, error: Error) => void;
+}
+
+// WebSocket route definition
+interface WSRoute {
+  path: string;
+  handler: WebSocketHandler;
+}
+
 // Lifecycle hooks
 interface LifecycleHooks {
-  onBeforeStart?: () => Promise<void> | void;
-  onAfterStart?: () => Promise<void> | void;
-  onBeforeStop?: () => Promise<void> | void;
-  onAfterStop?: () => Promise<void> | void;
-  onBeforeRestart?: () => Promise<void> | void;
-  onAfterRestart?: () => Promise<void> | void;
-  onRequest?: (ctx: Context) => Promise<void> | void;
-  onResponse?: (ctx: Context, response: any) => Promise<any> | any;
-  onError?: (ctx: Context, error: Error) => Promise<any> | any;
+  onBeforeStart?: (instance: BXO) => Promise<void> | void;
+  onAfterStart?: (instance: BXO) => Promise<void> | void;
+  onBeforeStop?: (instance: BXO) => Promise<void> | void;
+  onAfterStop?: (instance: BXO) => Promise<void> | void;
+  onRequest?: (ctx: Context, instance: BXO) => Promise<void> | void;
+  onResponse?: (ctx: Context, response: any, instance: BXO) => Promise<any> | any;
+  onError?: (ctx: Context, error: Error, instance: BXO) => Promise<any> | any;
 }
 
 export default class BXO {
-  private routes: Route[] = [];
-  private plugins: Plugin[] = [];
+  private _routes: Route[] = [];
+  private _wsRoutes: WSRoute[] = [];
+  private plugins: BXO[] = [];
   private hooks: LifecycleHooks = {};
   private server?: any;
   private isRunning: boolean = false;
-  private hotReloadEnabled: boolean = false;
-  private watchedFiles: Set<string> = new Set();
+  private serverPort?: number;
+  private serverHostname?: string;
 
-  constructor() {}
+  constructor() { }
 
   // Lifecycle hook methods
-  onBeforeStart(handler: () => Promise<void> | void): this {
+  onBeforeStart(handler: (instance: BXO) => Promise<void> | void): this {
     this.hooks.onBeforeStart = handler;
     return this;
   }
 
-  onAfterStart(handler: () => Promise<void> | void): this {
+  onAfterStart(handler: (instance: BXO) => Promise<void> | void): this {
     this.hooks.onAfterStart = handler;
     return this;
   }
 
-  onBeforeStop(handler: () => Promise<void> | void): this {
+  onBeforeStop(handler: (instance: BXO) => Promise<void> | void): this {
     this.hooks.onBeforeStop = handler;
     return this;
   }
 
-  onAfterStop(handler: () => Promise<void> | void): this {
+  onAfterStop(handler: (instance: BXO) => Promise<void> | void): this {
     this.hooks.onAfterStop = handler;
     return this;
   }
 
-  onBeforeRestart(handler: () => Promise<void> | void): this {
-    this.hooks.onBeforeRestart = handler;
-    return this;
-  }
 
-  onAfterRestart(handler: () => Promise<void> | void): this {
-    this.hooks.onAfterRestart = handler;
-    return this;
-  }
 
-  onRequest(handler: (ctx: Context) => Promise<void> | void): this {
+  onRequest(handler: (ctx: Context, instance: BXO) => Promise<void> | void): this {
     this.hooks.onRequest = handler;
     return this;
   }
 
-  onResponse(handler: (ctx: Context, response: any) => Promise<any> | any): this {
+  onResponse(handler: (ctx: Context, response: any, instance: BXO) => Promise<any> | any): this {
     this.hooks.onResponse = handler;
     return this;
   }
 
-  onError(handler: (ctx: Context, error: Error) => Promise<any> | any): this {
+  onError(handler: (ctx: Context, error: Error, instance: BXO) => Promise<any> | any): this {
     this.hooks.onError = handler;
     return this;
   }
 
-  // Plugin system
-  use(plugin: Plugin): this {
-    this.plugins.push(plugin);
+  // Plugin system - now accepts other BXO instances
+  use(bxoInstance: BXO): this {
+    this.plugins.push(bxoInstance);
     return this;
   }
 
@@ -139,7 +147,7 @@ export default class BXO {
     handler: Handler<TConfig>,
     config?: TConfig
   ): this {
-    this.routes.push({ method: 'GET', path, handler, config });
+    this._routes.push({ method: 'GET', path, handler, config });
     return this;
   }
 
@@ -157,7 +165,7 @@ export default class BXO {
     handler: Handler<TConfig>,
     config?: TConfig
   ): this {
-    this.routes.push({ method: 'POST', path, handler, config });
+    this._routes.push({ method: 'POST', path, handler, config });
     return this;
   }
 
@@ -175,7 +183,7 @@ export default class BXO {
     handler: Handler<TConfig>,
     config?: TConfig
   ): this {
-    this.routes.push({ method: 'PUT', path, handler, config });
+    this._routes.push({ method: 'PUT', path, handler, config });
     return this;
   }
 
@@ -193,7 +201,7 @@ export default class BXO {
     handler: Handler<TConfig>,
     config?: TConfig
   ): this {
-    this.routes.push({ method: 'DELETE', path, handler, config });
+    this._routes.push({ method: 'DELETE', path, handler, config });
     return this;
   }
 
@@ -211,28 +219,75 @@ export default class BXO {
     handler: Handler<TConfig>,
     config?: TConfig
   ): this {
-    this.routes.push({ method: 'PATCH', path, handler, config });
+    this._routes.push({ method: 'PATCH', path, handler, config });
     return this;
+  }
+
+  // WebSocket route handler
+  ws(path: string, handler: WebSocketHandler): this {
+    this._wsRoutes.push({ path, handler });
+    return this;
+  }
+
+  // Helper methods to get all routes including plugin routes
+  private getAllRoutes(): Route[] {
+    const allRoutes = [...this._routes];
+    for (const plugin of this.plugins) {
+      allRoutes.push(...plugin._routes);
+    }
+    return allRoutes;
+  }
+
+  private getAllWSRoutes(): WSRoute[] {
+    const allWSRoutes = [...this._wsRoutes];
+    for (const plugin of this.plugins) {
+      allWSRoutes.push(...plugin._wsRoutes);
+    }
+    return allWSRoutes;
   }
 
   // Route matching utility
   private matchRoute(method: string, pathname: string): { route: Route; params: Record<string, string> } | null {
-    for (const route of this.routes) {
+    const allRoutes = this.getAllRoutes();
+
+    for (const route of allRoutes) {
       if (route.method !== method) continue;
 
       const routeSegments = route.path.split('/').filter(Boolean);
       const pathSegments = pathname.split('/').filter(Boolean);
 
-      if (routeSegments.length !== pathSegments.length) continue;
-
       const params: Record<string, string> = {};
       let isMatch = true;
+
+      // Handle wildcard at the end (catch-all)
+      const hasWildcardAtEnd = routeSegments.length > 0 && routeSegments[routeSegments.length - 1] === '*';
+
+      if (hasWildcardAtEnd) {
+        // For catch-all wildcard, path must have at least as many segments as route (minus the wildcard)
+        if (pathSegments.length < routeSegments.length - 1) continue;
+      } else {
+        // For exact matching (with possible single-segment wildcards), lengths must match
+        if (routeSegments.length !== pathSegments.length) continue;
+      }
 
       for (let i = 0; i < routeSegments.length; i++) {
         const routeSegment = routeSegments[i];
         const pathSegment = pathSegments[i];
 
-        if (!routeSegment || !pathSegment) {
+        if (!routeSegment) {
+          isMatch = false;
+          break;
+        }
+
+        // Handle catch-all wildcard at the end
+        if (routeSegment === '*' && i === routeSegments.length - 1) {
+          // Wildcard at end matches remaining path segments
+          const remainingPath = pathSegments.slice(i).join('/');
+          params['*'] = remainingPath;
+          break;
+        }
+
+        if (!pathSegment) {
           isMatch = false;
           break;
         }
@@ -240,6 +295,73 @@ export default class BXO {
         if (routeSegment.startsWith(':')) {
           const paramName = routeSegment.slice(1);
           params[paramName] = decodeURIComponent(pathSegment);
+        } else if (routeSegment === '*') {
+          // Single segment wildcard
+          params['*'] = decodeURIComponent(pathSegment);
+        } else if (routeSegment !== pathSegment) {
+          isMatch = false;
+          break;
+        }
+      }
+
+      if (isMatch) {
+        return { route, params };
+      }
+    }
+
+    return null;
+  }
+
+  // WebSocket route matching utility
+  private matchWSRoute(pathname: string): { route: WSRoute; params: Record<string, string> } | null {
+    const allWSRoutes = this.getAllWSRoutes();
+
+    for (const route of allWSRoutes) {
+      const routeSegments = route.path.split('/').filter(Boolean);
+      const pathSegments = pathname.split('/').filter(Boolean);
+
+      const params: Record<string, string> = {};
+      let isMatch = true;
+
+      // Handle wildcard at the end (catch-all)
+      const hasWildcardAtEnd = routeSegments.length > 0 && routeSegments[routeSegments.length - 1] === '*';
+
+      if (hasWildcardAtEnd) {
+        // For catch-all wildcard, path must have at least as many segments as route (minus the wildcard)
+        if (pathSegments.length < routeSegments.length - 1) continue;
+      } else {
+        // For exact matching (with possible single-segment wildcards), lengths must match
+        if (routeSegments.length !== pathSegments.length) continue;
+      }
+
+      for (let i = 0; i < routeSegments.length; i++) {
+        const routeSegment = routeSegments[i];
+        const pathSegment = pathSegments[i];
+
+        if (!routeSegment) {
+          isMatch = false;
+          break;
+        }
+
+        // Handle catch-all wildcard at the end
+        if (routeSegment === '*' && i === routeSegments.length - 1) {
+          // Wildcard at end matches remaining path segments
+          const remainingPath = pathSegments.slice(i).join('/');
+          params['*'] = remainingPath;
+          break;
+        }
+
+        if (!pathSegment) {
+          isMatch = false;
+          break;
+        }
+
+        if (routeSegment.startsWith(':')) {
+          const paramName = routeSegment.slice(1);
+          params[paramName] = decodeURIComponent(pathSegment);
+        } else if (routeSegment === '*') {
+          // Single segment wildcard
+          params['*'] = decodeURIComponent(pathSegment);
         } else if (routeSegment !== pathSegment) {
           isMatch = false;
           break;
@@ -279,10 +401,29 @@ export default class BXO {
   }
 
   // Main request handler
-  private async handleRequest(request: Request): Promise<Response> {
+  private async handleRequest(request: Request, server?: any): Promise<Response | undefined> {
     const url = new URL(request.url);
     const method = request.method;
     const pathname = url.pathname;
+
+    // Check for WebSocket upgrade
+    if (request.headers.get('upgrade') === 'websocket') {
+      const wsMatchResult = this.matchWSRoute(pathname);
+      if (wsMatchResult && server) {
+        const success = server.upgrade(request, {
+          data: {
+            handler: wsMatchResult.route.handler,
+            params: wsMatchResult.params,
+            pathname
+          }
+        });
+
+        if (success) {
+          return; // undefined response means upgrade was successful
+        }
+      }
+      return new Response('WebSocket upgrade failed', { status: 400 });
+    }
 
     const matchResult = this.matchRoute(method, pathname);
     if (!matchResult) {
@@ -316,6 +457,7 @@ export default class BXO {
       query: route.config?.query ? this.validateData(route.config.query, query) : query,
       body: route.config?.body ? this.validateData(route.config.body, body) : body,
       headers: route.config?.headers ? this.validateData(route.config.headers, headers) : headers,
+      path: pathname,
       request,
       set: {}
     };
@@ -323,13 +465,13 @@ export default class BXO {
     try {
       // Run global onRequest hook
       if (this.hooks.onRequest) {
-        await this.hooks.onRequest(ctx);
+        await this.hooks.onRequest(ctx, this);
       }
 
-      // Run plugin onRequest hooks
-      for (const plugin of this.plugins) {
-        if (plugin.onRequest) {
-          await plugin.onRequest(ctx);
+      // Run BXO instance onRequest hooks
+      for (const bxoInstance of this.plugins) {
+        if (bxoInstance.hooks.onRequest) {
+          await bxoInstance.hooks.onRequest(ctx, this);
         }
       }
 
@@ -338,19 +480,62 @@ export default class BXO {
 
       // Run global onResponse hook
       if (this.hooks.onResponse) {
-        response = await this.hooks.onResponse(ctx, response) || response;
+        response = await this.hooks.onResponse(ctx, response, this) || response;
       }
 
-      // Run plugin onResponse hooks
-      for (const plugin of this.plugins) {
-        if (plugin.onResponse) {
-          response = await plugin.onResponse(ctx, response) || response;
+      // Run BXO instance onResponse hooks
+      for (const bxoInstance of this.plugins) {
+        if (bxoInstance.hooks.onResponse) {
+          response = await bxoInstance.hooks.onResponse(ctx, response, this) || response;
+        }
+      }
+
+      // Validate response against schema if provided
+      if (route.config?.response && !(response instanceof Response)) {
+        try {
+          response = this.validateData(route.config.response, response);
+        } catch (validationError) {
+          // Response validation failed
+          const errorMessage = validationError instanceof Error ? validationError.message : 'Response validation failed';
+          return new Response(JSON.stringify({ error: `Response validation error: ${errorMessage}` }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' }
+          });
         }
       }
 
       // Convert response to Response object
       if (response instanceof Response) {
         return response;
+      }
+
+      // Handle File response (like Elysia)
+      if (response instanceof File || (typeof Bun !== 'undefined' && response instanceof Bun.file('').constructor)) {
+        const file = response as File;
+        const responseInit: ResponseInit = {
+          status: ctx.set.status || 200,
+          headers: {
+            'Content-Type': file.type || 'application/octet-stream',
+            'Content-Length': file.size.toString(),
+            ...ctx.set.headers
+          }
+        };
+        return new Response(file, responseInit);
+      }
+
+      // Handle Bun.file() response
+      if (typeof response === 'object' && response && 'stream' in response && 'size' in response) {
+        const bunFile = response as any;
+        const responseInit: ResponseInit = {
+          status: ctx.set.status || 200,
+          headers: {
+            'Content-Type': bunFile.type || 'application/octet-stream',
+            'Content-Length': bunFile.size?.toString() || '',
+            ...ctx.set.headers,
+            ...(bunFile.headers || {}) // Support custom headers from file helper
+          }
+        };
+        return new Response(bunFile, responseInit);
       }
 
       const responseInit: ResponseInit = {
@@ -375,12 +560,12 @@ export default class BXO {
       let errorResponse: any;
 
       if (this.hooks.onError) {
-        errorResponse = await this.hooks.onError(ctx, error as Error);
+        errorResponse = await this.hooks.onError(ctx, error as Error, this);
       }
 
-      for (const plugin of this.plugins) {
-        if (plugin.onError) {
-          errorResponse = await plugin.onError(ctx, error as Error) || errorResponse;
+      for (const bxoInstance of this.plugins) {
+        if (bxoInstance.hooks.onError) {
+          errorResponse = await bxoInstance.hooks.onError(ctx, error as Error, this) || errorResponse;
         }
       }
 
@@ -403,32 +588,7 @@ export default class BXO {
     }
   }
 
-  // Hot reload functionality
-  enableHotReload(watchPaths: string[] = ['./']): this {
-    this.hotReloadEnabled = true;
-    watchPaths.forEach(path => this.watchedFiles.add(path));
-    return this;
-  }
 
-  private async setupFileWatcher(port: number, hostname: string): Promise<void> {
-    if (!this.hotReloadEnabled) return;
-
-    const fs = require('fs');
-    
-    for (const watchPath of this.watchedFiles) {
-      try {
-        fs.watch(watchPath, { recursive: true }, async (eventType: string, filename: string) => {
-          if (filename && (filename.endsWith('.ts') || filename.endsWith('.js'))) {
-            console.log(`🔄 File changed: ${filename}, restarting server...`);
-            await this.restart(port, hostname);
-          }
-        });
-        console.log(`👀 Watching ${watchPath} for changes...`);
-      } catch (error) {
-        console.warn(`⚠️  Could not watch ${watchPath}:`, error);
-      }
-    }
-  }
 
   // Server management methods
   async start(port: number = 3000, hostname: string = 'localhost'): Promise<void> {
@@ -440,26 +600,48 @@ export default class BXO {
     try {
       // Before start hook
       if (this.hooks.onBeforeStart) {
-        await this.hooks.onBeforeStart();
+        await this.hooks.onBeforeStart(this);
       }
 
       this.server = Bun.serve({
         port,
         hostname,
-        fetch: (request) => this.handleRequest(request),
+        fetch: (request, server) => this.handleRequest(request, server),
+        websocket: {
+          message: (ws: any, message: any) => {
+            const handler = ws.data?.handler;
+            if (handler?.onMessage) {
+              handler.onMessage(ws, message);
+            }
+          },
+          open: (ws: any) => {
+            const handler = ws.data?.handler;
+            if (handler?.onOpen) {
+              handler.onOpen(ws);
+            }
+          },
+          close: (ws: any, code?: number, reason?: string) => {
+            const handler = ws.data?.handler;
+            if (handler?.onClose) {
+              handler.onClose(ws, code, reason);
+            }
+          }
+        }
       });
 
-      this.isRunning = true;
+      // Verify server was created successfully
+      if (!this.server) {
+        throw new Error('Failed to create server instance');
+      }
 
-      console.log(`🦊 BXO server running at http://${hostname}:${port}`);
+      this.isRunning = true;
+      this.serverPort = port;
+      this.serverHostname = hostname;
 
       // After start hook
       if (this.hooks.onAfterStart) {
-        await this.hooks.onAfterStart();
+        await this.hooks.onAfterStart(this);
       }
-
-      // Setup hot reload
-      await this.setupFileWatcher(port, hostname);
 
       // Handle graceful shutdown
       const shutdownHandler = async () => {
@@ -485,55 +667,49 @@ export default class BXO {
     try {
       // Before stop hook
       if (this.hooks.onBeforeStop) {
-        await this.hooks.onBeforeStop();
+        await this.hooks.onBeforeStop(this);
       }
 
       if (this.server) {
-        this.server.stop();
-        this.server = null;
+        try {
+          // Try to stop the server gracefully
+          if (typeof this.server.stop === 'function') {
+            this.server.stop();
+          } else {
+            console.warn('⚠️  Server stop method not available');
+          }
+        } catch (stopError) {
+          console.error('❌ Error calling server.stop():', stopError);
+        }
+        
+        // Clear the server reference
+        this.server = undefined;
       }
 
+      // Reset state regardless of server.stop() success
       this.isRunning = false;
-
-      console.log('🛑 BXO server stopped');
+      this.serverPort = undefined;
+      this.serverHostname = undefined;
 
       // After stop hook
       if (this.hooks.onAfterStop) {
-        await this.hooks.onAfterStop();
+        await this.hooks.onAfterStop(this);
       }
+
+      console.log('✅ Server stopped successfully');
 
     } catch (error) {
       console.error('❌ Error stopping server:', error);
+      // Even if there's an error, reset the state
+      this.isRunning = false;
+      this.server = undefined;
+      this.serverPort = undefined;
+      this.serverHostname = undefined;
       throw error;
     }
   }
 
-  async restart(port: number = 3000, hostname: string = 'localhost'): Promise<void> {
-    try {
-      // Before restart hook
-      if (this.hooks.onBeforeRestart) {
-        await this.hooks.onBeforeRestart();
-      }
 
-      console.log('🔄 Restarting BXO server...');
-      
-      await this.stop();
-      
-      // Small delay to ensure cleanup
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
-      await this.start(port, hostname);
-
-      // After restart hook
-      if (this.hooks.onAfterRestart) {
-        await this.hooks.onAfterRestart();
-      }
-      
-    } catch (error) {
-      console.error('❌ Error restarting server:', error);
-      throw error;
-    }
-  }
 
   // Backward compatibility
   async listen(port: number = 3000, hostname: string = 'localhost'): Promise<void> {
@@ -542,22 +718,127 @@ export default class BXO {
 
   // Server status
   isServerRunning(): boolean {
-    return this.isRunning;
+    return this.isRunning && this.server !== undefined;
   }
 
-  getServerInfo(): { running: boolean; hotReload: boolean; watchedFiles: string[] } {
+  getServerInfo(): { running: boolean } {
     return {
-      running: this.isRunning,
-      hotReload: this.hotReloadEnabled,
-      watchedFiles: Array.from(this.watchedFiles)
+      running: this.isRunning
     };
+  }
+
+  // Get server information (alias for getServerInfo)
+  get info() {
+    // Calculate total routes including plugins
+    const totalRoutes = this._routes.length + this.plugins.reduce((total, plugin) => total + plugin._routes.length, 0);
+    const totalWsRoutes = this._wsRoutes.length + this.plugins.reduce((total, plugin) => total + plugin._wsRoutes.length, 0);
+
+    return {
+      // Server status
+      running: this.isRunning,
+      server: this.server ? 'Bun' : null,
+
+      // Connection details
+      hostname: this.serverHostname,
+      port: this.serverPort,
+      url: this.isRunning && this.serverHostname && this.serverPort
+        ? `http://${this.serverHostname}:${this.serverPort}`
+        : null,
+
+      // Application statistics
+      totalRoutes,
+      totalWsRoutes,
+      totalPlugins: this.plugins.length,
+
+      // System information
+      runtime: 'Bun',
+      version: typeof Bun !== 'undefined' ? Bun.version : 'unknown',
+      pid: process.pid,
+      uptime: this.isRunning ? process.uptime() : 0
+    };
+  }
+
+  // Get all routes information
+  get routes() {
+    // Get routes from main instance
+    const mainRoutes = this._routes.map((route: Route) => ({
+      method: route.method,
+      path: route.path,
+      hasConfig: !!route.config,
+      config: route.config || null,
+      source: 'main' as const
+    }));
+
+    // Get routes from all plugins
+    const pluginRoutes = this.plugins.flatMap((plugin, pluginIndex) =>
+      plugin._routes.map((route: Route) => ({
+        method: route.method,
+        path: route.path,
+        hasConfig: !!route.config,
+        config: route.config || null,
+        source: 'plugin' as const,
+        pluginIndex
+      }))
+    );
+
+    return [...mainRoutes, ...pluginRoutes];
+  }
+
+  // Get all WebSocket routes information
+  get wsRoutes() {
+    // Get WebSocket routes from main instance
+    const mainWsRoutes = this._wsRoutes.map((route: WSRoute) => ({
+      path: route.path,
+      hasHandlers: {
+        onOpen: !!route.handler.onOpen,
+        onMessage: !!route.handler.onMessage,
+        onClose: !!route.handler.onClose,
+        onError: !!route.handler.onError
+      },
+      source: 'main' as const
+    }));
+
+    // Get WebSocket routes from all plugins
+    const pluginWsRoutes = this.plugins.flatMap((plugin, pluginIndex) =>
+      plugin._wsRoutes.map((route: WSRoute) => ({
+        path: route.path,
+        hasHandlers: {
+          onOpen: !!route.handler.onOpen,
+          onMessage: !!route.handler.onMessage,
+          onClose: !!route.handler.onClose,
+          onError: !!route.handler.onError
+        },
+        source: 'plugin' as const,
+        pluginIndex
+      }))
+    );
+
+    return [...mainWsRoutes, ...pluginWsRoutes];
   }
 }
 
-// Export Zod for convenience
-export { z };
+const error = (error: Error | string, status: number = 500) => {
+  return new Response(JSON.stringify({ error: error instanceof Error ? error.message : error }), { status });
+}
 
-export type { Plugin } from './plugins';
+// File helper function (like Elysia)
+const file = (path: string, options?: { type?: string; headers?: Record<string, string> }) => {
+  const bunFile = Bun.file(path);
+
+  if (options?.type) {
+    // Create a wrapper to override the MIME type
+    return {
+      ...bunFile,
+      type: options.type,
+      headers: options.headers
+    };
+  }
+
+  return bunFile;
+}
+
+// Export Zod for convenience
+export { z, error, file };
 
 // Export types for external use
-export type { RouteConfig };
+export type { RouteConfig, RouteDetail, Handler, WebSocketHandler, WSRoute };
