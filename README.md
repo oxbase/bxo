@@ -20,7 +20,7 @@ BXO is a fast, lightweight, and fully type-safe web framework built specifically
 ### Installation
 
 ```bash
-bun add zod
+bun add bxo
 ```
 
 ### Basic Usage
@@ -93,10 +93,85 @@ interface Context<TConfig> {
     status?: number;
     headers?: Record<string, string>;
   };
+  status: (code: number, data?: any) => any;  // Type-safe status method
   user?: any;                    // Added by auth plugin
   [key: string]: any;            // Extended by plugins
 }
 ```
+
+### Type-Safe Status Method
+
+BXO provides a type-safe `ctx.status()` method similar to Elysia, which allows you to set HTTP status codes and return data in one call:
+
+```typescript
+// Simple usage
+app.get('/hello', (ctx) => {
+  return ctx.status(200, { message: 'Hello World' });
+});
+
+// With response validation
+app.get('/user/:id', (ctx) => {
+  const userId = ctx.params.id;
+  
+  if (userId === 'not-found') {
+    // TypeScript suggests 404 as valid status
+    return ctx.status(404, { error: 'User not found' });
+  }
+  
+  // TypeScript suggests 200 as valid status
+  return ctx.status(200, { user: { id: userId, name: 'John Doe' } });
+}, {
+  response: {
+    200: z.object({
+      user: z.object({
+        id: z.string(),
+        name: z.string()
+      })
+    }),
+    404: z.object({
+      error: z.string()
+    })
+  }
+});
+
+// POST with validation and status responses
+app.post('/users', (ctx) => {
+  const { name, email } = ctx.body;
+  
+  if (!name || !email) {
+    return ctx.status(400, { error: 'Missing required fields' });
+  }
+  
+  return ctx.status(201, { 
+    success: true, 
+    user: { id: 1, name, email } 
+  });
+}, {
+  body: z.object({
+    name: z.string(),
+    email: z.string().email()
+  }),
+  response: {
+    201: z.object({
+      success: z.boolean(),
+      user: z.object({
+        id: z.number(),
+        name: z.string(),
+        email: z.string()
+      })
+    }),
+    400: z.object({
+      error: z.string()
+    })
+  }
+});
+```
+
+**Key Features:**
+- **Type Safety**: Status codes are suggested based on your response configuration
+- **Data Validation**: Return data is validated against the corresponding schema
+- **Autocomplete**: TypeScript provides autocomplete for valid status codes
+- **Return Type Inference**: Return types are properly inferred from schemas
 
 ### Validation Configuration
 

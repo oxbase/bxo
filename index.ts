@@ -3,6 +3,31 @@ import { z } from 'zod';
 // Type utilities for extracting types from Zod schemas
 type InferZodType<T> = T extends z.ZodType<infer U> ? U : never;
 
+// Response configuration types
+type ResponseSchema = z.ZodSchema<any>;
+type StatusResponseSchema = Record<number, ResponseSchema>;
+type ResponseConfig = ResponseSchema | StatusResponseSchema;
+
+// Type utility to extract response type from response config
+type InferResponseType<T> = T extends ResponseSchema 
+  ? InferZodType<T>
+  : T extends StatusResponseSchema 
+    ? { [K in keyof T]: InferZodType<T[K]> }[keyof T]
+    : never;
+
+// Cookie interface
+interface Cookie {
+  name: string;
+  value: string;
+  domain?: string;
+  path?: string;
+  expires?: Date;
+  maxAge?: number;
+  secure?: boolean;
+  httpOnly?: boolean;
+  sameSite?: 'Strict' | 'Lax' | 'None';
+}
+
 // OpenAPI detail information
 interface RouteDetail {
   summary?: string;
@@ -21,9 +46,13 @@ interface RouteConfig {
   query?: z.ZodSchema<any>;
   body?: z.ZodSchema<any>;
   headers?: z.ZodSchema<any>;
-  response?: z.ZodSchema<any>;
+  cookies?: z.ZodSchema<any>;
+  response?: ResponseConfig;
   detail?: RouteDetail;
 }
+
+// Helper type to extract status codes from response config
+type StatusCodes<T> = T extends Record<number, any> ? keyof T : never;
 
 // Context type that's fully typed based on the route configuration
 export type Context<TConfig extends RouteConfig = {}> = {
@@ -31,17 +60,37 @@ export type Context<TConfig extends RouteConfig = {}> = {
   query: TConfig['query'] extends z.ZodSchema<any> ? InferZodType<TConfig['query']> : Record<string, string | undefined>;
   body: TConfig['body'] extends z.ZodSchema<any> ? InferZodType<TConfig['body']> : unknown;
   headers: TConfig['headers'] extends z.ZodSchema<any> ? InferZodType<TConfig['headers']> : Record<string, string>;
+  cookies: TConfig['cookies'] extends z.ZodSchema<any> ? InferZodType<TConfig['cookies']> : Record<string, string>;
   path: string;
   request: Request;
   set: {
     status?: number;
     headers?: Record<string, string>;
+    cookies?: Cookie[];
   };
+  status: <T extends number>(
+    code: TConfig['response'] extends StatusResponseSchema 
+      ? StatusCodes<TConfig['response']> | number
+      : T,
+    data?: TConfig['response'] extends StatusResponseSchema 
+      ? T extends keyof TConfig['response'] 
+        ? InferZodType<TConfig['response'][T]>
+        : any
+      : TConfig['response'] extends ResponseSchema 
+        ? InferZodType<TConfig['response']>
+        : any
+  ) => TConfig['response'] extends StatusResponseSchema 
+    ? T extends keyof TConfig['response'] 
+      ? InferZodType<TConfig['response'][T]>
+      : any
+    : TConfig['response'] extends ResponseSchema 
+      ? InferZodType<TConfig['response']>
+      : any;
   [key: string]: any;
 };
 
-// Handler function type
-type Handler<TConfig extends RouteConfig = {}, EC = {}> = (ctx: Context<TConfig> & EC) => Promise<any> | any;
+// Handler function type with proper response typing
+type Handler<TConfig extends RouteConfig = {}, EC = {}> = (ctx: Context<TConfig> & EC) => Promise<InferResponseType<TConfig['response']> | any> | InferResponseType<TConfig['response']> | any;
 
 // Route definition
 interface Route {
@@ -379,25 +428,74 @@ export default class BXO {
   // Parse query string
   private parseQuery(searchParams: URLSearchParams): Record<string, string | undefined> {
     const query: Record<string, string | undefined> = {};
-    for (const [key, value] of searchParams.entries()) {
+    searchParams.forEach((value, key) => {
       query[key] = value;
-    }
+    });
     return query;
   }
 
   // Parse headers
   private parseHeaders(headers: Headers): Record<string, string> {
     const headerObj: Record<string, string> = {};
-    for (const [key, value] of headers.entries()) {
+    headers.forEach((value, key) => {
       headerObj[key] = value;
-    }
+    });
     return headerObj;
+  }
+
+  // Parse cookies from Cookie header
+  private parseCookies(cookieHeader: string | null): Record<string, string> {
+    const cookies: Record<string, string> = {};
+    
+    if (!cookieHeader) return cookies;
+    
+    const cookiePairs = cookieHeader.split(';');
+    for (const pair of cookiePairs) {
+      const [name, value] = pair.trim().split('=');
+      if (name && value) {
+        cookies[decodeURIComponent(name)] = decodeURIComponent(value);
+      }
+    }
+    
+    return cookies;
   }
 
   // Validate data against Zod schema
   private validateData<T>(schema: z.ZodSchema<T> | undefined, data: any): T {
     if (!schema) return data;
     return schema.parse(data);
+  }
+
+  // Validate response against response config (supports both simple and status-based schemas)
+  private validateResponse(responseConfig: ResponseConfig | undefined, data: any, status: number = 200): any {
+    if (!responseConfig) return data;
+    
+    // If it's a simple schema (not status-based)
+    if ('parse' in responseConfig && typeof responseConfig.parse === 'function') {
+      return responseConfig.parse(data);
+    }
+    
+    // If it's a status-based schema
+    if (typeof responseConfig === 'object' && !('parse' in responseConfig)) {
+      const statusSchema = responseConfig[status];
+      if (statusSchema) {
+        return statusSchema.parse(data);
+      }
+      
+      // If no specific status schema found, try to find a fallback
+      // Common fallback statuses: 200, 201, 400, 500
+      const fallbackStatuses = [200, 201, 400, 500];
+      for (const fallbackStatus of fallbackStatuses) {
+        if (responseConfig[fallbackStatus]) {
+          return responseConfig[fallbackStatus].parse(data);
+        }
+      }
+      
+      // If no schema found for the status, return data as-is
+      return data;
+    }
+    
+    return data;
   }
 
   // Main request handler
@@ -433,6 +531,7 @@ export default class BXO {
     const { route, params } = matchResult;
     const query = this.parseQuery(url.searchParams);
     const headers = this.parseHeaders(request.headers);
+    const cookies = this.parseCookies(request.headers.get('cookie'));
 
     let body: any;
     if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -447,20 +546,71 @@ export default class BXO {
         const formData = await request.formData();
         body = Object.fromEntries(formData.entries());
       } else {
-        body = await request.text();
+        // Try to parse as JSON if it looks like JSON, otherwise treat as text
+        const textBody = await request.text();
+        try {
+          // Check if the text looks like JSON
+          if (textBody.trim().startsWith('{') || textBody.trim().startsWith('[')) {
+            body = JSON.parse(textBody);
+          } else {
+            body = textBody;
+          }
+        } catch {
+          body = textBody;
+        }
       }
     }
 
-    // Create context
-    const ctx: Context = {
-      params: route.config?.params ? this.validateData(route.config.params, params) : params,
-      query: route.config?.query ? this.validateData(route.config.query, query) : query,
-      body: route.config?.body ? this.validateData(route.config.body, body) : body,
-      headers: route.config?.headers ? this.validateData(route.config.headers, headers) : headers,
-      path: pathname,
-      request,
-      set: {}
-    };
+    // Create context with validation
+    let ctx: Context;
+    try {
+      // Validate each part separately to get better error messages
+      const validatedParams = route.config?.params ? this.validateData(route.config.params, params) : params;
+      const validatedQuery = route.config?.query ? this.validateData(route.config.query, query) : query;
+      const validatedBody = route.config?.body ? this.validateData(route.config.body, body) : body;
+      const validatedHeaders = route.config?.headers ? this.validateData(route.config.headers, headers) : headers;
+      const validatedCookies = route.config?.cookies ? this.validateData(route.config.cookies, cookies) : cookies;
+      
+      ctx = {
+        params: validatedParams,
+        query: validatedQuery,
+        body: validatedBody,
+        headers: validatedHeaders,
+        cookies: validatedCookies,
+        path: pathname,
+        request,
+        set: {},
+        status: ((code: number, data?: any) => {
+          ctx.set.status = code;
+          return data;
+        }) as any
+      };
+    } catch (validationError) {
+      // Validation failed - return error response
+      
+      // Extract detailed validation errors from Zod
+      let validationDetails = undefined;
+      if (validationError instanceof Error) {
+        if ('errors' in validationError && Array.isArray(validationError.errors)) {
+          validationDetails = validationError.errors;
+        } else if ('issues' in validationError && Array.isArray(validationError.issues)) {
+          validationDetails = validationError.issues;
+        }
+      }
+      
+      // Create a clean error message
+      const errorMessage = validationDetails && validationDetails.length > 0 
+        ? `Validation failed for ${validationDetails.length} field(s)`
+        : 'Validation failed';
+      
+      return new Response(JSON.stringify({ 
+        error: errorMessage,
+        details: validationDetails
+      }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
     try {
       // Run global onRequest hook
@@ -493,11 +643,30 @@ export default class BXO {
       // Validate response against schema if provided
       if (route.config?.response && !(response instanceof Response)) {
         try {
-          response = this.validateData(route.config.response, response);
+          const status = ctx.set.status || 200;
+          response = this.validateResponse(route.config.response, response, status);
         } catch (validationError) {
           // Response validation failed
-          const errorMessage = validationError instanceof Error ? validationError.message : 'Response validation failed';
-          return new Response(JSON.stringify({ error: `Response validation error: ${errorMessage}` }), {
+          
+          // Extract detailed validation errors from Zod
+          let validationDetails = undefined;
+          if (validationError instanceof Error) {
+            if ('errors' in validationError && Array.isArray(validationError.errors)) {
+              validationDetails = validationError.errors;
+            } else if ('issues' in validationError && Array.isArray(validationError.issues)) {
+              validationDetails = validationError.issues;
+            }
+          }
+          
+          // Create a clean error message
+          const errorMessage = validationDetails && validationDetails.length > 0 
+            ? `Response validation failed for ${validationDetails.length} field(s)`
+            : 'Response validation failed';
+          
+          return new Response(JSON.stringify({ 
+            error: errorMessage,
+            details: validationDetails
+          }), {
             status: 500,
             headers: { 'Content-Type': 'application/json' }
           });
@@ -538,9 +707,34 @@ export default class BXO {
         return new Response(bunFile, responseInit);
       }
 
+      // Prepare headers with cookies
+      let responseHeaders = ctx.set.headers ? { ...ctx.set.headers } : {};
+      
+      // Handle cookies if any are set
+      if (ctx.set.cookies && ctx.set.cookies.length > 0) {
+        const cookieHeaders = ctx.set.cookies.map(cookie => {
+          let cookieString = `${encodeURIComponent(cookie.name)}=${encodeURIComponent(cookie.value)}`;
+          
+          if (cookie.domain) cookieString += `; Domain=${cookie.domain}`;
+          if (cookie.path) cookieString += `; Path=${cookie.path}`;
+          if (cookie.expires) cookieString += `; Expires=${cookie.expires.toUTCString()}`;
+          if (cookie.maxAge) cookieString += `; Max-Age=${cookie.maxAge}`;
+          if (cookie.secure) cookieString += `; Secure`;
+          if (cookie.httpOnly) cookieString += `; HttpOnly`;
+          if (cookie.sameSite) cookieString += `; SameSite=${cookie.sameSite}`;
+          
+          return cookieString;
+        });
+        
+        // Add Set-Cookie headers
+        cookieHeaders.forEach((cookieHeader, index) => {
+          responseHeaders[index === 0 ? 'Set-Cookie' : `Set-Cookie-${index}`] = cookieHeader;
+        });
+      }
+
       const responseInit: ResponseInit = {
         status: ctx.set.status || 200,
-        headers: ctx.set.headers || {}
+        headers: responseHeaders
       };
 
       if (typeof response === 'string') {
@@ -841,4 +1035,15 @@ const file = (path: string, options?: { type?: string; headers?: Record<string, 
 export { z, error, file };
 
 // Export types for external use
-export type { RouteConfig, RouteDetail, Handler, WebSocketHandler, WSRoute };
+export type { RouteConfig, RouteDetail, Handler, WebSocketHandler, WSRoute, Cookie };
+
+// Helper function to create a cookie
+export const createCookie = (
+  name: string,
+  value: string,
+  options: Omit<Cookie, 'name' | 'value'> = {}
+): Cookie => ({
+  name,
+  value,
+  ...options
+});
